@@ -1,7 +1,3 @@
-# INC알고리즘을 활용한 MPPT제어 시뮬레이션
-# 2025/04/12/토
-# 배재대학교 전기전자공학과 2146031 정승준
-
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -25,7 +21,7 @@ I_sc = 8.5              # 단락 전류(A)
 
 # 일사량 변동
 # 00:00.000 ~ 00:02:999 (안정기): 일사량 1000 W/m² 유지 (초기 목표점 도달 및 진동 확인)
-# 00:03.000 ~ 00:05.999 (구름 통과): 일사량 500 W/m² 로 급락 (갑자기 줄어든 일사량에 대한 추종 속도 확인)
+# 00:03.000 ~ 00:05.999 (구름 통과): 일사량 500    로 급락 (갑자기 줄어든 일사량에 대한 추종 속도 확인)
 # 00:06.000 ~ 00:10.000 (다시 맑아짐): 일사량 1000 W/m² 로 급등 (P&O가 방향을 잃고 헤매는지, INC가 안정적으로 쫓아가는지 확인)
 
 
@@ -43,7 +39,7 @@ P_old = 0         # 이전 전력
 
 time_start = 0      # 시작시간
 time_run = 10       # 작동시간
-# time_run = 4      # 작동시간
+# time_run = 4      # 작동시간(test)
 time_step = 0.01    # 시간간격
 time = np.arange(time_start * 1000, (time_run + time_step) * 1000, time_step * 1000) / 1000           # 부동 소수점 오류 주의
 
@@ -186,37 +182,102 @@ class INC:
 # =======================
 # ==== 시뮬레이션 시작 ====
 # =======================
-# plt.ion()
-# fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+plt.ion()
 
-# line_irr, = axes[0].plot([], [], linewidth=2, label="Irradiance")
-# axes[0].set_ylabel("PV Power")
-# axes[0].set_xlabel("PV Voltage")
-# axes[0].grid(True)
-# axes[0].legend(loc="upper right")
+fig = plt.figure(figsize=(16,13))
+gs = fig.add_gridspec(4,2)
 
-# line_vref, = axes[1].plot([], [], '--', linewidth=1.5, label="Vref")
-# axes[1].axhline(V_mp, linestyle=':', linewidth=1.5, label="Vmp=30V")
-# axes[1].set_ylabel("Voltage [V]")
-# axes[1].grid(True)
-# axes[1].legend(loc="upper right")
-
-# line_ppv, = axes[2].plot([], [], '--', linewidth=1.5, label="Ideal MPP Power")
-# axes[2].set_ylabel("Power [W]")
-# axes[2].grid(True)
-# axes[2].legend(loc="upper right")
-
-# fig.suptitle(f"INC MPPT Real-Time Tracking  (dt={time_step}s, step={Step_size}V)", fontsize=14)
-# plt.tight_layout()
+axes = []
+axes.append(fig.add_subplot(gs[0,:]))
+axes.append(fig.add_subplot(gs[1,:]))
+axes.append(fig.add_subplot(gs[2,:]))
+axes.append(fig.add_subplot(gs[3,0]))
+axes.append(fig.add_subplot(gs[3,1]))
 
 
-V_old = V_arr[0] 
-I_old = I_arr[0] 
-P_old = P_arr[0] 
+line_vp, = axes[0].plot([], [], linewidth=2, label="V-P line")
+axes[0].set_xlabel("PV Voltage")
+axes[0].set_ylabel("PV Power")
+axes[0].grid(True)
+axes[0].set_xlim(0, V_oc + 1)
+axes[0].set_ylim(0, P_max + 30)  
+axes[0].legend(loc="upper right")
+
+line_vt, = axes[1].plot([], [], linewidth=1.5, label="Vref")
+axes[1].axhline(V_mp, ls='--', linestyle=':', linewidth=1.5, label="Vmp=30V")
+axes[1].set_ylabel("Voltage [V]")
+axes[1].grid(True)  
+axes[1].set_xlim(0, time_run)
+axes[1].set_ylim(0, V_oc + 2)
+axes[1].legend(loc="upper right")
+
+line_pt, = axes[2].plot([], [], linewidth=1.5, label="Ideal MPP Power")
+axes[2].set_ylabel("Power [W]")
+axes[2].grid(True)
+axes[2].set_xlim(0, time_run)
+axes[2].set_ylim(0, P_max + 30)
+axes[2].legend(loc="upper right")
+
+# 특정 구간 1 확대
+line_vt1, = axes[3].plot([], [], linewidth=1.5, label="Zoom : 3 ~ 4 sec")
+# axes[3].plot(time, V_arr, 'b')
+axes[3].grid()
+axes[3].set_xlim(2.5, 3.5)
+axes[3].set_ylim(20, V_oc + 2)
+
+# 특정 구간 2 확대
+line_vt2, = axes[4].plot([], [], linewidth=1.5, label="Zoom : 6 ~ 7 sec")
+# axes[4].plot(time, V_arr, 'r')
+axes[4].grid()
+axes[4].set_xlim(5.5, 6.5)
+axes[4].set_ylim(20, V_oc + 2)
+
+fig.suptitle(f"INC MPPT Real-Time Tracking  (dt={time_step}s, step={Step_size}V)", fontsize=14)
+plt.tight_layout()
+# =============================================================
+# ----------------
+# 오류코드
+# ----------------
+# V_old = V_arr[0] 
+# I_old = I_arr[0] 
+# P_old = P_arr[0] 
 
 
-for i in range(1, len(time)):    # 실제 시뮬레이션 time for문   *0초는 제외!
-# for i in range(0, 10, 1):        # 테스트 용 for문
+# for i in range(1, len(time)):    # 실제 시뮬레이션 time for문   *0초는 제외!
+# # for i in range(0, 10, 1):        # 테스트 용 for문
+
+#   # 시간 변화에 따른 일사량
+#   if (0 <= time[i] and time[i] < 3):
+#     irradiance = 1000
+#   elif (3 <= time[i] and time[i] < 6):
+#     irradiance = 500
+#   else : 
+#     irradiance = 1000
+
+#   V_arr[i] = V_pv
+#   I_arr[i] = I_pv
+#   P_arr[i] = P_pv
+
+#   sp = PvPanal(irradiance, temperature, V_pv, I_pv, P_pv)           # irradiance, temperature, V_pv, I_pv, P_pv
+#   V_pv = sp.PvVoltage()      # 현재 전압
+#   I_pv = sp.PvCurrent()      # 현재 전류
+#   P_pv = sp.PvPower()        # 현재 전력
+
+#   Mppt = INC(V_pv, I_pv, P_pv, V_old, I_old, P_old, V_ref, Step_size)        # V_pv, I_pv, P_pv, V_old, I_old, P_old, V_ref, Step_size
+#   V_ref = Mppt.Vref()
+#   V_pv = V_ref
+#   # print('INC code:', Mppt.code)                             # INC알고리즘 동작 확인 코드 
+  
+
+#   V_old = V_arr[i - 1]      # 현재 전압       * i = 0일 경우  배열의 마지막 값이 들어가므로 주의
+#   I_old = I_arr[i - 1]      # 현재 전류
+#   P_old = P_arr[i - 1]      # 현재 전력
+# 
+# =============================================================
+# ----------------
+# 정상코드
+# ----------------
+for i in range(len(time)):    # 실제 시뮬레이션 time for문   *0초는 제외!
 
   # 시간 변화에 따른 일사량
   if (0 <= time[i] and time[i] < 3):
@@ -226,68 +287,54 @@ for i in range(1, len(time)):    # 실제 시뮬레이션 time for문   *0초는
   else : 
     irradiance = 1000
 
-  V_arr[i] = V_pv
-  I_arr[i] = I_pv
-  P_arr[i] = P_pv
 
   sp = PvPanal(irradiance, temperature, V_pv, I_pv, P_pv)           # irradiance, temperature, V_pv, I_pv, P_pv
   V_pv = sp.PvVoltage()      # 현재 전압
   I_pv = sp.PvCurrent()      # 현재 전류
   P_pv = sp.PvPower()        # 현재 전력
+  
+  V_arr[i] = V_pv
+  I_arr[i] = I_pv
+  P_arr[i] = P_pv
 
   Mppt = INC(V_pv, I_pv, P_pv, V_old, I_old, P_old, V_ref, Step_size)        # V_pv, I_pv, P_pv, V_old, I_old, P_old, V_ref, Step_size
   V_ref = Mppt.Vref()
   # print('INC code:', Mppt.code)                             # INC알고리즘 동작 확인 코드 
   
 
-  V_old = V_arr[i - 1]      # 현재 전압       * i = 0일 경우  배열의 마지막 값이 들어가므로 주의
-  I_old = I_arr[i - 1]      # 현재 전류
-  P_old = P_arr[i - 1]      # 현재 전력
+  V_old = V_pv      # 현재 전압       
+  I_old = I_pv      # 현재 전류
+  P_old = P_pv      # 현재 전력
+
   V_pv = V_ref
+# ==============================================================
 
-  # line_irr.set_data(V_arr[:i], P_arr[:i])
-  # line_vref.set_data(time[:i], V_arr[:i])
-  # line_ppv.set_data(time[:i], P_arr[:i])
-  
-  # for ax in axes:
-  #   ax.set_xlim(0, time_run)
-  # axes[0].set_ylim(V_oc + 2, P_max + 30)
-  # axes[1].set_ylim(0, V_oc + 2)
-  # axes[2].set_ylim(0, P_max + 30)
-
-  # plt.pause(0.001)
+  line_vp.set_data(V_arr[:i+1], P_arr[:i+1])        # 전압-전력
+  line_vt.set_data(time[:i+1], V_arr[:i+1])         # 시간-전압
+  line_pt.set_data(time[:i+1], P_arr[:i+1])         # 시간-전력
+  line_vt1.set_data(time[:i+1], V_arr[:i+1])
+  line_vt2.set_data(time[:i+1], V_arr[:i+1])
+  plt.pause(0.001)
   
   # 확인용 print() 구문
-  print(f"Time={time[i]:3f} ,G={irradiance}, Vpv={V_pv:.2f},  Vref={V_ref:.2f}, Ipv={I_pv:.2f}, Ppv = {P_pv:.2f}")    
-
-# 확인용 print() 구문
-# print('V_arr', V_arr)
-# print('I_arr', I_arr)
-# print('P_arr', P_arr)
-
-# ==================================
+  # print(f"Time={time[i]:3f} ,G={irradiance}, Vpv={V_pv:.2f},  Vref={V_ref:.2f}, Ipv={I_pv:.2f}, Ppv = {P_pv:.2f}")    
 
 
+# ===================================
 # plt 실행
 # 전압-전력 그래프
-plt.subplot(3,1,1)
-plt.plot(V_arr, P_arr, 'k.-')
-plt.xlabel('Voltage')
-plt.ylabel('Power')
-plt.grid()
-
-# 전압-전류 그래프
-# plt.plot(V_arr, I_arr, 'k.-')
+# plt.subplot(3,1,1)
+# plt.plot(V_arr, P_arr, 'k.-')
 # plt.xlabel('Voltage')
-# plt.ylabel('Current')
+# plt.ylabel('Power')
 # plt.grid()
 
 # # 시간-전압 그래프
-plt.subplot(3,1,2)
-plt.plot(time, V_arr, 'k.-')
-plt.xlabel('time')
-plt.ylabel('Voltage')
-plt.grid()
+# plt.subplot(3,1,2)
+# plt.plot(time, V_arr, 'k.-')
+# plt.xlabel('time')
+# plt.ylabel('Voltage')
+# plt.grid()
 
 # 시간-전류 그래프
 # plt.plot(time, I_arr, 'k.-')
@@ -295,12 +342,6 @@ plt.grid()
 # plt.ylabel('Current')
 # plt.grid()
 
-plt.subplot(3,1,3)
-plt.plot(time, P_arr, 'k.-')
-plt.xlabel('time')
-plt.ylabel('Power')
-plt.grid()
-
-# plt.ioff()
+plt.ioff()
 plt.show()
 print('end')
