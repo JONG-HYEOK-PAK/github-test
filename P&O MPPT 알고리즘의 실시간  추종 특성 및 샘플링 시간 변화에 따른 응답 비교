@@ -1,0 +1,643 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
+import time
+
+# ============================================================
+# 1. 기본 조건
+# ============================================================
+V_INIT = 15.0
+DELTA_V = 0.5
+
+IRR_STC = 1000.0
+TEMP_C = 25.0
+
+P_MAX = 250.0
+V_MP = 30.0
+V_OC = 37.0
+I_SC = 8.5
+
+T_END = 10.0
+TAU = 0.03
+
+MASTER_DT = 0.01
+
+LIVE_UPDATE_EVERY = 15
+REALTIME_PLAYBACK = True
+PLAYBACK_SPEED = 2.0
+
+ZOOM_HALF_WINDOW = 0.35
+
+SETTLING_BAND = 0.02
+SETTLING_HOLD = 0.15
+
+RIPPLE_WINDOWS = [
+    ("before 3s", 2.50, 2.95),
+    ("after 3s",  3.25, 3.95),
+    ("before 6s", 5.05, 5.85),
+    ("after 6s",  6.25, 6.95),
+]
+
+plt.rcParams["axes.unicode_minus"] = False
+
+
+# ============================================================
+# 2. 일사량 프로파일
+# ============================================================
+def irradiance(t: float) -> float:
+    if 0.0 <= t < 3.0:
+        return 1000.0
+    elif 3.0 <= t < 6.0:
+        return 500.0
+    else:
+        return 1000.0
+
+
+# ============================================================
+# 3. PV 모델
+# ============================================================
+def solve_shape_exponent(vmp: float, voc: float, tol: float = 1e-12) -> float:
+    r = vmp / voc
+
+    def f(a):
+        return (r ** a) - (1.0 / (1.0 + a))
+
+    lo, hi = 1e-8, 100.0
+    flo, fhi = f(lo), f(hi)
+
+    if flo * fhi > 0:
+        raise RuntimeError("Exponent solving failed: invalid bracket.")
+
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        fmid = f(mid)
+
+        if abs(fmid) < tol:
+            return mid
+
+        if flo * fmid < 0:
+            hi = mid
+        else:
+            lo = mid
+            flo = fmid
+
+    return 0.5 * (lo + hi)
+
+
+A_EXP = solve_shape_exponent(V_MP, V_OC)
+K_SCALE = P_MAX / (V_MP * I_SC * (1.0 - (V_MP / V_OC) ** A_EXP))
+
+
+def pv_current(voltage: float, irr: float) -> float:
+    v = np.clip(voltage, 0.0, V_OC)
+    g_ratio = irr / IRR_STC
+    current = K_SCALE * I_SC * g_ratio * (1.0 - (v / V_OC) ** A_EXP)
+    return max(current, 0.0)
+
+
+def pv_power(voltage: float, irr: float) -> float:
+    return voltage * pv_current(voltage, irr)
+
+
+# ============================================================
+# 4. P&O MPPT 제어기
+# ============================================================
+class PerturbAndObserveMPPT:
+    def __init__(self, v_init: float, delta_v: float, v_min: float = 0.0, v_max: float = V_OC):
+        self.v_ref = float(v_init)
+        self.delta_v = float(delta_v)
+        self.v_min = float(v_min)
+        self.v_max = float(v_max)
+
+        self.prev_v = None
+        self.prev_p = None
+        self.direction = +1.0
+
+    def update(self, measured_v: float, measured_i: float) -> float:
+        p = measured_v * measured_i
+
+        if self.prev_v is None or self.prev_p is None:
+            self.prev_v = measured_v
+            self.prev_p = p
+            self.v_ref = np.clip(self.v_ref + self.direction * self.delta_v, self.v_min, self.v_max)
+            return self.v_ref
+
+        dV = measured_v - self.prev_v
+        dP = p - self.prev_p
+
+        if dP > 0:
+            if dV > 0:
+                self.direction = +1.0
+            elif dV < 0:
+                self.direction = -1.0
+
+        elif dP < 0:
+            if dV > 0:
+                self.direction = -1.0
+            elif dV < 0:
+                self.direction = +1.0
+
+        self.v_ref = np.clip(self.v_ref + self.direction * self.delta_v, self.v_min, self.v_max)
+
+        self.prev_v = measured_v
+        self.prev_p = p
+        return self.v_ref
+
+
+# ============================================================
+# 5. 케이스 상태
+# ============================================================
+class POCase:
+    def __init__(self, control_dt: float, name: str):
+        self.control_dt = control_dt
+        self.name = name
+        self.controller = PerturbAndObserveMPPT(V_INIT, DELTA_V, 0.0, V_OC)
+
+        self.v_pv = V_INIT
+        self.v_ref = V_INIT
+        self.next_control_time = 0.0
+
+    def step(self, t: float, irr: float, plant_dt: float):
+        i_pv = pv_current(self.v_pv, irr)
+        p_pv = self.v_pv * i_pv
+
+        p_mpp = P_MAX * (irr / IRR_STC)
+        i_mpp = p_mpp / V_MP if V_MP > 1e-12 else 0.0
+        eff = 100.0 * p_pv / p_mpp if p_mpp > 1e-12 else 0.0
+        p_err = p_mpp - p_pv
+
+        if t + 1e-12 >= self.next_control_time:
+            self.v_ref = self.controller.update(self.v_pv, i_pv)
+            self.next_control_time += self.control_dt
+
+        alpha = np.clip(plant_dt / TAU, 0.0, 1.0)
+        self.v_pv = np.clip(self.v_pv + alpha * (self.v_ref - self.v_pv), 0.0, V_OC)
+
+        return {
+            "v_pv": self.v_pv,
+            "v_ref": self.v_ref,
+            "i_pv": i_pv,
+            "i_mpp": i_mpp,
+            "p_pv": p_pv,
+            "p_mpp": p_mpp,
+            "p_err": p_err,
+            "eff": eff,
+        }
+
+
+# ============================================================
+# 6. 그래프 스타일
+# ============================================================
+def style_axis(ax, y_label=None, x_label=None, x_major=1.0, x_minor=0.2):
+    if y_label is not None:
+        ax.set_ylabel(y_label, fontsize=10)
+    if x_label is not None:
+        ax.set_xlabel(x_label, fontsize=10)
+
+    ax.grid(True, which="major", linewidth=0.8, alpha=0.85)
+    ax.grid(True, which="minor", linewidth=0.35, alpha=0.45)
+    ax.minorticks_on()
+    ax.xaxis.set_major_locator(MultipleLocator(x_major))
+    ax.xaxis.set_minor_locator(MultipleLocator(x_minor))
+
+
+def add_cursor(ax, color="crimson"):
+    return ax.axvline(0.0, color=color, linestyle="-", linewidth=1.0, alpha=0.8)
+
+
+def set_cursor(cursor_line, x):
+    cursor_line.set_xdata([x, x])
+
+
+def adaptive_error_ylim(ax, y1, y2, margin=0.12, min_half_range=0.35, max_half_range=2.0):
+    vals = np.concatenate([y1, y2]) if len(y1) and len(y2) else np.array([0.0])
+    max_abs = np.max(np.abs(vals)) if vals.size > 0 else 0.0
+    half = min(max(max_abs + margin, min_half_range), max_half_range)
+    ax.set_ylim(-half, half)
+
+
+# ============================================================
+# 7. 라이브 대시보드
+# ============================================================
+def setup_live_dashboard():
+    plt.ion()
+
+    fig = plt.figure(figsize=(24, 13))
+    gs = fig.add_gridspec(5, 3, width_ratios=[1.9, 1.1, 1.1], wspace=0.28, hspace=0.35)
+
+    ax_irr = fig.add_subplot(gs[0, 0])
+    ax_v   = fig.add_subplot(gs[1, 0])
+    ax_i   = fig.add_subplot(gs[2, 0])
+    ax_p   = fig.add_subplot(gs[3, 0])
+    ax_eff = fig.add_subplot(gs[4, 0])
+
+    ax_z3_v = fig.add_subplot(gs[0, 1])
+    ax_z3_i = fig.add_subplot(gs[1, 1])
+    ax_z3_p = fig.add_subplot(gs[2, 1])
+    ax_z3_err = fig.add_subplot(gs[3:, 1])
+
+    ax_z6_v = fig.add_subplot(gs[0, 2])
+    ax_z6_i = fig.add_subplot(gs[1, 2])
+    ax_z6_p = fig.add_subplot(gs[2, 2])
+    ax_z6_err = fig.add_subplot(gs[3:, 2])
+
+    lines = {}
+
+    c_fast = "tab:blue"
+    c_slow = "tab:orange"
+    c_ref = "black"
+
+    # ---------------------- Overview ----------------------
+    lines["irr"], = ax_irr.plot([], [], color=c_ref, linewidth=2.2,
+                                drawstyle="steps-post", label="Irr")
+
+    lines["v01"], = ax_v.plot([], [], color=c_fast, linewidth=2.0, label="Vpv 0.01")
+    lines["vr01"], = ax_v.plot([], [], color=c_fast, linestyle="--", linewidth=1.0, alpha=0.30,
+                               drawstyle="steps-post", label="Vref 0.01")
+    lines["v05"], = ax_v.plot([], [], color=c_slow, linewidth=2.0, label="Vpv 0.05")
+    lines["vr05"], = ax_v.plot([], [], color=c_slow, linestyle="--", linewidth=1.0, alpha=0.30,
+                               drawstyle="steps-post", label="Vref 0.05")
+    ax_v.axhline(V_MP, color=c_ref, linestyle=":", linewidth=1.4, label="Vmp")
+
+    lines["i01"], = ax_i.plot([], [], color=c_fast, linewidth=2.0, label="Ipv 0.01")
+    lines["i05"], = ax_i.plot([], [], color=c_slow, linewidth=2.0, label="Ipv 0.05")
+    lines["impp"], = ax_i.plot([], [], color=c_ref, linestyle="--", linewidth=1.3,
+                               drawstyle="steps-post", label="Imp")
+
+    lines["p01"], = ax_p.plot([], [], color=c_fast, linewidth=2.0, label="Ppv 0.01")
+    lines["p05"], = ax_p.plot([], [], color=c_slow, linewidth=2.0, label="Ppv 0.05")
+    lines["pmpp"], = ax_p.plot([], [], color=c_ref, linestyle="--", linewidth=1.3,
+                               drawstyle="steps-post", label="Pmp")
+
+    lines["e01"], = ax_eff.plot([], [], color=c_fast, linewidth=2.0, label="Eff 0.01")
+    lines["e05"], = ax_eff.plot([], [], color=c_slow, linewidth=2.0, label="Eff 0.05")
+
+    # ---------------------- Zoom around 3s ----------------------
+    lines["z3_v01"], = ax_z3_v.plot([], [], color=c_fast, linewidth=2.0, label="V 0.01")
+    lines["z3_v05"], = ax_z3_v.plot([], [], color=c_slow, linewidth=2.0, label="V 0.05")
+    ax_z3_v.axhline(V_MP, color=c_ref, linestyle=":", linewidth=1.4, label="Vmp")
+
+    lines["z3_i01"], = ax_z3_i.plot([], [], color=c_fast, linewidth=2.0)
+    lines["z3_i05"], = ax_z3_i.plot([], [], color=c_slow, linewidth=2.0)
+    lines["z3_impp"], = ax_z3_i.plot([], [], color=c_ref, linestyle="--", linewidth=1.3,
+                                     drawstyle="steps-post")
+
+    lines["z3_p01"], = ax_z3_p.plot([], [], color=c_fast, linewidth=2.0)
+    lines["z3_p05"], = ax_z3_p.plot([], [], color=c_slow, linewidth=2.0)
+    lines["z3_pmpp"], = ax_z3_p.plot([], [], color=c_ref, linestyle="--", linewidth=1.3,
+                                     drawstyle="steps-post")
+
+    lines["z3_err01"], = ax_z3_err.plot([], [], color=c_fast, linewidth=2.0)
+    lines["z3_err05"], = ax_z3_err.plot([], [], color=c_slow, linewidth=2.0)
+    ax_z3_err.axhline(0.0, color=c_ref, linestyle=":", linewidth=1.2)
+
+    # ---------------------- Zoom around 6s ----------------------
+    lines["z6_v01"], = ax_z6_v.plot([], [], color=c_fast, linewidth=2.0, label="V 0.01")
+    lines["z6_v05"], = ax_z6_v.plot([], [], color=c_slow, linewidth=2.0, label="V 0.05")
+    ax_z6_v.axhline(V_MP, color=c_ref, linestyle=":", linewidth=1.4, label="Vmp")
+
+    lines["z6_i01"], = ax_z6_i.plot([], [], color=c_fast, linewidth=2.0)
+    lines["z6_i05"], = ax_z6_i.plot([], [], color=c_slow, linewidth=2.0)
+    lines["z6_impp"], = ax_z6_i.plot([], [], color=c_ref, linestyle="--", linewidth=1.3,
+                                     drawstyle="steps-post")
+
+    lines["z6_p01"], = ax_z6_p.plot([], [], color=c_fast, linewidth=2.0)
+    lines["z6_p05"], = ax_z6_p.plot([], [], color=c_slow, linewidth=2.0)
+    lines["z6_pmpp"], = ax_z6_p.plot([], [], color=c_ref, linestyle="--", linewidth=1.3,
+                                     drawstyle="steps-post")
+
+    lines["z6_err01"], = ax_z6_err.plot([], [], color=c_fast, linewidth=2.0)
+    lines["z6_err05"], = ax_z6_err.plot([], [], color=c_slow, linewidth=2.0)
+    ax_z6_err.axhline(0.0, color=c_ref, linestyle=":", linewidth=1.2)
+
+    # ---------------------- 커서 ----------------------
+    cursor_axes = [
+        ax_irr, ax_v, ax_i, ax_p, ax_eff,
+        ax_z3_v, ax_z3_i, ax_z3_p, ax_z3_err,
+        ax_z6_v, ax_z6_i, ax_z6_p, ax_z6_err
+    ]
+    cursors = [add_cursor(ax) for ax in cursor_axes]
+
+    # ---------------------- 축 스타일 ----------------------
+    for ax, yl in [
+        (ax_irr, "Irr [W/m²]"),
+        (ax_v, "Voltage [V]"),
+        (ax_i, "Current [A]"),
+        (ax_p, "Power [W]"),
+        (ax_eff, "Efficiency [%]"),
+    ]:
+        style_axis(ax, y_label=yl, x_major=1.0, x_minor=0.2)
+        ax.axvline(3.0, linestyle="--", linewidth=1.0, color="gray")
+        ax.axvline(6.0, linestyle="--", linewidth=1.0, color="gray")
+        ax.set_xlim(0, T_END)
+        ax.legend(loc="upper right", fontsize=7, framealpha=0.9)
+
+    ax_eff.set_xlabel("Time [s]")
+    ax_irr.set_ylim(0, 1100)
+    ax_v.set_ylim(10, 32)
+    ax_i.set_ylim(0, I_SC + 1.0)
+    ax_p.set_ylim(0, P_MAX + 30)
+    ax_eff.set_ylim(0, 105)
+
+    for ax, yl in [
+        (ax_z3_v, "3s Voltage [V]"),
+        (ax_z3_i, "3s Current [A]"),
+        (ax_z3_p, "3s Power [W]"),
+        (ax_z3_err, "3s P_err [W]"),
+    ]:
+        style_axis(ax, y_label=yl, x_major=0.1, x_minor=0.02)
+        ax.axvline(3.0, linestyle="--", linewidth=1.0, color="gray")
+        ax.set_xlim(3.0 - ZOOM_HALF_WINDOW, 3.0 + ZOOM_HALF_WINDOW)
+
+    ax_z3_v.legend(loc="upper right", fontsize=7, framealpha=0.9)
+    ax_z3_err.set_xlabel("Time [s]")
+    ax_z3_v.set_ylim(29.4, 30.8)
+    ax_z3_i.set_ylim(3.8, 8.8)
+    ax_z3_p.set_ylim(115, 255)
+    ax_z3_err.set_ylim(-1.5, 1.5)
+
+    for ax, yl in [
+        (ax_z6_v, "6s Voltage [V]"),
+        (ax_z6_i, "6s Current [A]"),
+        (ax_z6_p, "6s Power [W]"),
+        (ax_z6_err, "6s P_err [W]"),
+    ]:
+        style_axis(ax, y_label=yl, x_major=0.1, x_minor=0.02)
+        ax.axvline(6.0, linestyle="--", linewidth=1.0, color="gray")
+        ax.set_xlim(6.0 - ZOOM_HALF_WINDOW, 6.0 + ZOOM_HALF_WINDOW)
+
+    ax_z6_v.legend(loc="upper right", fontsize=7, framealpha=0.9)
+    ax_z6_err.set_xlabel("Time [s]")
+    ax_z6_v.set_ylim(29.0, 30.8)
+    ax_z6_i.set_ylim(3.8, 8.8)
+    ax_z6_p.set_ylim(115, 255)
+    ax_z6_err.set_ylim(-1.5, 1.5)
+
+    fig.suptitle("P&O MPPT Live Dashboard: Overview + Zoom around 3s + Zoom around 6s",
+                 fontsize=16, y=0.98)
+
+    fig.tight_layout(rect=[0.02, 0.02, 0.98, 0.94])
+
+    return {
+        "fig": fig,
+        "lines": lines,
+        "cursors": cursors,
+        "ax_z3_err": ax_z3_err,
+        "ax_z6_err": ax_z6_err,
+    }
+
+
+# ============================================================
+# 8. 대시보드 업데이트
+# ============================================================
+def update_live_dashboard(dash, history, k):
+    lines = dash["lines"]
+
+    r01 = history["dt=0.01s"]
+    r05 = history["dt=0.05s"]
+
+    t = np.array(r01["time"][:k+1])
+
+    irr = np.array(r01["irradiance"][:k+1])
+
+    r01_vpv = np.array(r01["v_pv"][:k+1])
+    r01_vr  = np.array(r01["v_ref"][:k+1])
+    r01_ipv = np.array(r01["i_pv"][:k+1])
+    r01_impp = np.array(r01["i_mpp"][:k+1])
+    r01_ppv = np.array(r01["p_pv"][:k+1])
+    r01_pmpp = np.array(r01["p_mpp"][:k+1])
+    r01_perr = np.array(r01["p_err"][:k+1])
+    r01_eff = np.array(r01["efficiency"][:k+1])
+
+    r05_vpv = np.array(r05["v_pv"][:k+1])
+    r05_vr  = np.array(r05["v_ref"][:k+1])
+    r05_ipv = np.array(r05["i_pv"][:k+1])
+    r05_ppv = np.array(r05["p_pv"][:k+1])
+    r05_perr = np.array(r05["p_err"][:k+1])
+    r05_eff = np.array(r05["efficiency"][:k+1])
+
+    # Overview
+    lines["irr"].set_data(t, irr)
+
+    lines["v01"].set_data(t, r01_vpv)
+    lines["vr01"].set_data(t, r01_vr)
+    lines["v05"].set_data(t, r05_vpv)
+    lines["vr05"].set_data(t, r05_vr)
+
+    lines["i01"].set_data(t, r01_ipv)
+    lines["i05"].set_data(t, r05_ipv)
+    lines["impp"].set_data(t, r01_impp)
+
+    lines["p01"].set_data(t, r01_ppv)
+    lines["p05"].set_data(t, r05_ppv)
+    lines["pmpp"].set_data(t, r01_pmpp)
+
+    lines["e01"].set_data(t, r01_eff)
+    lines["e05"].set_data(t, r05_eff)
+
+    # Zoom around 3s
+    mask3 = (t >= 3.0 - ZOOM_HALF_WINDOW) & (t <= 3.0 + ZOOM_HALF_WINDOW)
+
+    lines["z3_v01"].set_data(t[mask3], r01_vpv[mask3])
+    lines["z3_v05"].set_data(t[mask3], r05_vpv[mask3])
+
+    lines["z3_i01"].set_data(t[mask3], r01_ipv[mask3])
+    lines["z3_i05"].set_data(t[mask3], r05_ipv[mask3])
+    lines["z3_impp"].set_data(t[mask3], r01_impp[mask3])
+
+    lines["z3_p01"].set_data(t[mask3], r01_ppv[mask3])
+    lines["z3_p05"].set_data(t[mask3], r05_ppv[mask3])
+    lines["z3_pmpp"].set_data(t[mask3], r01_pmpp[mask3])
+
+    lines["z3_err01"].set_data(t[mask3], r01_perr[mask3])
+    lines["z3_err05"].set_data(t[mask3], r05_perr[mask3])
+
+    adaptive_error_ylim(
+        dash["ax_z3_err"],
+        r01_perr[mask3],
+        r05_perr[mask3],
+        margin=0.12,
+        min_half_range=0.35,
+        max_half_range=2.0
+    )
+
+    # Zoom around 6s
+    mask6 = (t >= 6.0 - ZOOM_HALF_WINDOW) & (t <= 6.0 + ZOOM_HALF_WINDOW)
+
+    lines["z6_v01"].set_data(t[mask6], r01_vpv[mask6])
+    lines["z6_v05"].set_data(t[mask6], r05_vpv[mask6])
+
+    lines["z6_i01"].set_data(t[mask6], r01_ipv[mask6])
+    lines["z6_i05"].set_data(t[mask6], r05_ipv[mask6])
+    lines["z6_impp"].set_data(t[mask6], r01_impp[mask6])
+
+    lines["z6_p01"].set_data(t[mask6], r01_ppv[mask6])
+    lines["z6_p05"].set_data(t[mask6], r05_ppv[mask6])
+    lines["z6_pmpp"].set_data(t[mask6], r01_pmpp[mask6])
+
+    lines["z6_err01"].set_data(t[mask6], r01_perr[mask6])
+    lines["z6_err05"].set_data(t[mask6], r05_perr[mask6])
+
+    adaptive_error_ylim(
+        dash["ax_z6_err"],
+        r01_perr[mask6],
+        r05_perr[mask6],
+        margin=0.12,
+        min_half_range=0.35,
+        max_half_range=2.0
+    )
+
+    # 현재 시간 커서
+    t_cur = t[-1]
+    for cursor in dash["cursors"]:
+        set_cursor(cursor, t_cur)
+
+    dash["fig"].canvas.draw_idle()
+    dash["fig"].canvas.flush_events()
+    plt.pause(0.001)
+
+
+# ============================================================
+# 9. 정량 분석
+# ============================================================
+def peak_to_peak(x):
+    x = np.asarray(x)
+    return float(np.max(x) - np.min(x)) if x.size > 0 else float("nan")
+
+
+def first_reach_time_to_band(t, y, y_ref_scalar, tol=0.02):
+    t = np.asarray(t)
+    y = np.asarray(y)
+    ref_abs = max(abs(y_ref_scalar), 1e-12)
+    err = np.abs(y - y_ref_scalar) / ref_abs
+    idx = np.where(err <= tol)[0]
+    return float(t[idx[0]]) if len(idx) > 0 else np.nan
+
+
+def find_settling_time(t, y, y_ref, start_time, tol=0.02, hold_time=0.15):
+    t = np.asarray(t)
+    y = np.asarray(y)
+    y_ref = np.asarray(y_ref)
+
+    start_idx = np.searchsorted(t, start_time, side="left")
+    if start_idx >= len(t):
+        return np.nan
+
+    ref_abs = np.maximum(np.abs(y_ref), 1e-12)
+    err = np.abs(y - y_ref) / ref_abs
+    hold_samples = max(1, int(np.ceil(hold_time / (t[1] - t[0]))))
+
+    for i in range(start_idx, len(t) - hold_samples + 1):
+        if np.all(err[i:i + hold_samples] <= tol):
+            return float(t[i] - start_time)
+
+    return np.nan
+
+
+def print_report(history):
+    print("\n" + "=" * 82)
+    print("P&O MPPT REPORT")
+    print("=" * 82)
+    print("현재 비교는 P&O vs P&O (샘플링 시간만 다름)")
+    print("따라서 차이는 알고리즘 종류가 아니라 dt 차이로 해석")
+    print(f"DELTA_V = {DELTA_V:.2f} V")
+    print("업데이트 주파수 = 1 / dt")
+    print("유효 perturb 속도 = DELTA_V / dt")
+
+    for label, h in history.items():
+        t = np.array(h["time"])
+        v = np.array(h["v_pv"])
+        i = np.array(h["i_pv"])
+        p = np.array(h["p_pv"])
+        pref = np.array(h["p_mpp"])
+        dt = 0.01 if label == "dt=0.01s" else 0.05
+
+        print("\n" + "-" * 82)
+        print(label)
+        print("-" * 82)
+        print(f"Control dt                                : {dt:.4f} s")
+        print(f"Update frequency 1/dt                     : {1.0/dt:.2f} Hz")
+        print(f"Effective perturb rate DELTA_V/dt         : {DELTA_V/dt:.2f} V/s")
+        print(f"Initial reach time to ±{SETTLING_BAND*100:.1f}% of 250 W : "
+              f"{first_reach_time_to_band(t, p, P_MAX, tol=SETTLING_BAND):.4f} s")
+        print(f"Settling time after 3 s transition        : "
+              f"{find_settling_time(t, p, pref, 3.0, tol=SETTLING_BAND, hold_time=SETTLING_HOLD):.4f} s")
+        print(f"Settling time after 6 s transition        : "
+              f"{find_settling_time(t, p, pref, 6.0, tol=SETTLING_BAND, hold_time=SETTLING_HOLD):.4f} s")
+
+        print("\nRipple (peak-to-peak)")
+        for name, t0, t1 in RIPPLE_WINDOWS:
+            mask = (t >= t0) & (t <= t1)
+            print(f"  {name:<12} "
+                  f"Vpp={peak_to_peak(v[mask]):.4f} V, "
+                  f"Ipp={peak_to_peak(i[mask]):.4f} A, "
+                  f"Ppp={peak_to_peak(p[mask]):.4f} W")
+
+
+# ============================================================
+# 10. 메인 실행
+# ============================================================
+def main():
+    time_arr = np.arange(0.0, T_END + MASTER_DT * 0.5, MASTER_DT)
+
+    cases = {
+        "dt=0.01s": POCase(0.01, "dt=0.01s"),
+        "dt=0.05s": POCase(0.05, "dt=0.05s"),
+    }
+
+    history = {}
+    for label in cases:
+        history[label] = {
+            "time": [],
+            "irradiance": [],
+            "v_pv": [],
+            "v_ref": [],
+            "i_pv": [],
+            "i_mpp": [],
+            "p_pv": [],
+            "p_mpp": [],
+            "p_err": [],
+            "efficiency": [],
+        }
+
+    dash = setup_live_dashboard()
+    plt.show(block=False)
+
+    wall_prev = time.perf_counter()
+
+    for k, t in enumerate(time_arr):
+        irr = irradiance(float(t))
+
+        for label, case in cases.items():
+            out = case.step(float(t), irr, MASTER_DT)
+
+            history[label]["time"].append(float(t))
+            history[label]["irradiance"].append(float(irr))
+            history[label]["v_pv"].append(float(out["v_pv"]))
+            history[label]["v_ref"].append(float(out["v_ref"]))
+            history[label]["i_pv"].append(float(out["i_pv"]))
+            history[label]["i_mpp"].append(float(out["i_mpp"]))
+            history[label]["p_pv"].append(float(out["p_pv"]))
+            history[label]["p_mpp"].append(float(out["p_mpp"]))
+            history[label]["p_err"].append(float(out["p_err"]))
+            history[label]["efficiency"].append(float(out["eff"]))
+
+        if k % LIVE_UPDATE_EVERY == 0 or k == len(time_arr) - 1:
+            update_live_dashboard(dash, history, k)
+
+        if REALTIME_PLAYBACK and k < len(time_arr) - 1:
+            target = MASTER_DT / max(PLAYBACK_SPEED, 1e-12)
+            now = time.perf_counter()
+            elapsed = now - wall_prev
+            if elapsed < target:
+                time.sleep(target - elapsed)
+            wall_prev = time.perf_counter()
+
+    print_report(history)
+
+    plt.ioff()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
